@@ -62,12 +62,12 @@ which boulder moss bsdtar update-desktop-database gtk-update-icon-cache
 1. **Clone the repository:**
    ```bash
    git clone https://github.com/your-username/stonify.git
-   cd stonify
+   cd stonify/src
    ```
 
 2. **Compile the binary:**
    ```bash
-   go build -o stonify main.go
+   go build stonify.go
    ```
 
 3. **Install the executable globally:**
