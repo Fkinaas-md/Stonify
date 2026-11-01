@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -11,29 +12,42 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
+)
+
+// --- ANSI Colors ---
+const (
+	Reset  = "\033[0m"
+	Red    = "\033[31m"
+	Green  = "\033[32m"
+	Yellow = "\033[33m"
+	Cyan   = "\033[36m"
+	Bold   = "\033[1m"
 )
 
 type DebMetadata struct {
-	Name        string
-	Version     string
-	Summary     string
-	Description string
-	Homepage    string
-	Depends     []string
-	AerynDeps   []string
+	Name         string
+	Version      string
+	Architecture string
+	Summary      string
+	Description  string
+	Homepage     string
+	AerynDeps    []string
 }
 
-// OverrideRules stores per-package customizations from stonify-rules.json
 type OverrideRules struct {
 	ExtraDeps []string `json:"extra_deps"`
 	ExecFlags string   `json:"exec_flags"`
+	Provides  []string `json:"provides"`
 }
 
 var depMap = map[string]string{
 	"libc6":                      "glibc",
-	"libgtk-3-0":                 "gtk3",
+	"libgtk-3-0":                 "gtk-3",
 	"libglib2.0-0":               "glib2",
 	"libasound2":                 "alsa-lib",
 	"libnss3":                    "nss",
@@ -44,113 +58,171 @@ var depMap = map[string]string{
 	"wget":                       "wget",
 }
 
+// --- CLI Spinner ---
+type Spinner struct {
+	stopChan chan struct{}
+	msg      string
+	mu       sync.Mutex
+}
+
+func NewSpinner(msg string) *Spinner {
+	return &Spinner{msg: msg, stopChan: make(chan struct{})}
+}
+
+func (s *Spinner) Start() {
+	go func() {
+		frames := []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
+		i := 0
+		for {
+			select {
+			case <-s.stopChan:
+				fmt.Printf("\r\033[K")
+				return
+			default:
+				s.mu.Lock()
+				msg := s.msg
+				s.mu.Unlock()
+				fmt.Printf("\r\033[K%s%s%s %s", Cyan, frames[i%len(frames)], Reset, msg)
+				i++
+				time.Sleep(80 * time.Millisecond)
+			}
+		}
+	}()
+}
+
+func (s *Spinner) Stop(successMsg string) {
+	close(s.stopChan)
+	time.Sleep(10 * time.Millisecond)
+	fmt.Printf("\r\033[K%s✔%s %s\n", Green, Reset, successMsg)
+}
+
+func (s *Spinner) Fail(errorMsg string) {
+	close(s.stopChan)
+	time.Sleep(10 * time.Millisecond)
+	fmt.Printf("\r\033[K%s✖%s %s\n", Red, Reset, errorMsg)
+}
+
+func (s *Spinner) UpdateMessage(msg string) {
+	s.mu.Lock()
+	s.msg = msg
+	s.mu.Unlock()
+}
+
+// --- Main Program ---
 func main() {
-	autoInstall := flag.Bool("install", false, "Automatically install the converted package using moss")
-	flag.BoolVar(autoInstall, "i", false, "Automatically install the converted package (shorthand)")
+	autoInstall := flag.Bool("install", false, "Автоматически установить собранный пакет через moss")
+	flag.BoolVar(autoInstall, "i", false, "Автоматически установить собранный пакет (сокращение)")
 	flag.Parse()
 
 	if flag.NArg() < 1 {
-		fmt.Println("Usage: stonify [-i|--install] <package.deb>")
+		fmt.Printf("%s%sИспользование:%s stonify [-i|--install] <файл.deb>\n", Bold, Cyan, Reset)
 		os.Exit(1)
 	}
 
 	debPath, err := filepath.Abs(flag.Arg(0))
 	if err != nil {
-		fmt.Printf("Error resolving path: %v\n", err)
+		fmt.Printf("%s✖ Ошибка получения пути:%s %v\n", Red, Reset, err)
 		os.Exit(1)
 	}
 
 	if _, err := os.Stat(debPath); os.IsNotExist(err) {
-		fmt.Printf("File not found: %s\n", debPath)
+		fmt.Printf("%s✖ Файл не найден:%s %s\n", Red, Reset, debPath)
 		os.Exit(1)
 	}
+
+	fmt.Printf("\n%s🚀 Запуск stonify — конвертера Debian -> AerynOS%s\n\n", Bold, Reset)
 
 	workDir, err := os.MkdirTemp(".", ".stonify-work-*")
 	if err != nil {
-		workDir, err = os.MkdirTemp("", "stonify-work-*")
-		if err != nil {
-			fmt.Printf("Error creating temporary directory: %v\n", err)
-			os.Exit(1)
-		}
+		fmt.Printf("%s✖ Ошибка создания временной папки:%s %v\n", Red, Reset, err)
+		os.Exit(1)
 	}
 	defer os.RemoveAll(workDir)
 
-	fmt.Printf("[1/6] Unpacking .deb archive: %s\n", filepath.Base(debPath))
+	sp := NewSpinner(fmt.Sprintf("Распаковка .deb архива: %s", filepath.Base(debPath)))
+	sp.Start()
 	controlTar, dataTar, err := extractArArchive(debPath, workDir)
 	if err != nil {
-		fmt.Printf("Error unpacking ar archive: %v\n", err)
+		sp.Fail(fmt.Sprintf("Ошибка распаковки ar архива: %v", err))
 		os.Exit(1)
 	}
+	sp.Stop("Архив успешно распакован")
 
-	fmt.Println("[2/6] Reading package metadata & mapping dependencies...")
-	meta, err := parseDebControl(controlTar, workDir)
+	sp = NewSpinner("Чтение метаданных и проверка архитектуры...")
+	sp.Start()
+	meta, err := parseDebControl(controlTar, workDir, sp)
 	if err != nil {
-		fmt.Printf("Error parsing control file: %v\n", err)
+		sp.Fail(fmt.Sprintf("Ошибка чтения control: %v", err))
 		os.Exit(1)
 	}
+	sp.Stop(fmt.Sprintf("Метаданные загружены (%s %s)", meta.Name, meta.Version))
 
 	rules := loadOverrides(meta.Name)
 	if rules != nil && len(rules.ExtraDeps) > 0 {
 		meta.AerynDeps = append(meta.AerynDeps, rules.ExtraDeps...)
 	}
-
 	if len(meta.AerynDeps) > 0 {
-		fmt.Printf("      -> Resolved runtime dependencies: %s\n", strings.Join(meta.AerynDeps, ", "))
+		fmt.Printf("   %s↳%s Зависимости для AerynOS: %s%s%s\n", Cyan, Reset, Yellow, strings.Join(meta.AerynDeps, ", "), Reset)
 	}
 
-	fmt.Println("[3/6] Extracting payload...")
+	sp = NewSpinner("Распаковка файловой системы пакета...")
+	sp.Start()
 	pkgDir := filepath.Join(workDir, "pkg")
 	rootfsDir := filepath.Join(pkgDir, "rootfs")
-	if err := os.MkdirAll(rootfsDir, 0755); err != nil {
-		fmt.Printf("Error creating rootfs directory: %v\n", err)
-		os.Exit(1)
-	}
+	os.MkdirAll(rootfsDir, 0755)
 	_ = os.Symlink(filepath.Join("pkg", "rootfs"), filepath.Join(workDir, "rootfs"))
 
 	if err := extractPayload(dataTar, rootfsDir); err != nil {
-		fmt.Printf("Error extracting payload: %v\n", err)
+		sp.Fail(fmt.Sprintf("Ошибка распаковки данных: %v", err))
 		os.Exit(1)
 	}
+	sp.Stop("Файловая система пакета распакована")
 
-	fmt.Println("[4/6] Stripping Debian cruft & normalizing layout (UsrMerge)...")
+	sp = NewSpinner("Очистка от Debian-мусора и адаптация (UsrMerge)...")
+	sp.Start()
 	removeDebianCruft(rootfsDir)
 	if err := normalizeAndFix(rootfsDir, meta, rules); err != nil {
-		fmt.Printf("Error normalizing rootfs: %v\n", err)
+		sp.Fail(fmt.Sprintf("Ошибка нормализации: %v", err))
 		os.Exit(1)
 	}
+	sp.Stop("Файловая система адаптирована под AerynOS")
 
-	fmt.Println("[5/6] Generating stone.yaml recipe...")
+	sp = NewSpinner("Генерация сборочного манифеста (stone.yaml)...")
+	sp.Start()
 	recipePath := filepath.Join(workDir, "stone.yaml")
-	if err := generateStoneYaml(recipePath, meta); err != nil {
-		fmt.Printf("Error generating stone.yaml: %v\n", err)
+	if err := generateStoneYaml(recipePath, meta, rules); err != nil {
+		sp.Fail(fmt.Sprintf("Ошибка генерации stone.yaml: %v", err))
 		os.Exit(1)
 	}
+	sp.Stop("Манифест stone.yaml успешно сгенерирован")
 
-	fmt.Println("[6/6] Building .stone package with boulder...")
+	sp = NewSpinner("Сборка пакета .stone через boulder (может занять время)...")
+	sp.Start()
 	stoneFile, err := buildWithBoulder(workDir)
 	if err != nil {
-		fmt.Printf("Boulder build error: %v\n", err)
+		sp.Fail(fmt.Sprintf("Ошибка сборки boulder: %v", err))
 		os.Exit(1)
 	}
+	sp.Stop("Пакет .stone успешно собран!")
 
 	currentDir, _ := os.Getwd()
 	finalStonePath := filepath.Join(currentDir, filepath.Base(stoneFile))
 	if err := copyFile(stoneFile, finalStonePath); err != nil {
-		fmt.Printf("Error saving output .stone: %v\n", err)
+		fmt.Printf("%s✖ Ошибка сохранения .stone:%s %v\n", Red, Reset, err)
 		os.Exit(1)
 	}
 
-	fmt.Printf("\n[Success] Package built: %s\n", filepath.Base(finalStonePath))
-	// Remove workDir ahead of moss index to prevent duplicate package release errors
+	fmt.Printf("\n%s✨ Готово! Собран пакет: %s%s%s\n", Bold, Green, filepath.Base(finalStonePath), Reset)
+	
 	os.RemoveAll(workDir)
 
 	shouldInstall := *autoInstall
 	if !shouldInstall {
-		fmt.Print("\nDo you want to install the package now? [y/N]: ")
+		fmt.Printf("\nХотите установить пакет в систему прямо сейчас? [y/N]: ")
 		reader := bufio.NewReader(os.Stdin)
 		input, _ := reader.ReadString('\n')
 		input = strings.TrimSpace(strings.ToLower(input))
-		if input == "y" || input == "yes" {
+		if input == "y" || input == "yes" || input == "д" || input == "да" {
 			shouldInstall = true
 		}
 	}
@@ -160,6 +232,53 @@ func main() {
 	}
 }
 
+func checkArchitecture(debArch string) error {
+	if debArch == "all" || debArch == "any" {
+		return nil
+	}
+	archMap := map[string]string{
+		"amd64": "amd64",
+		"arm64": "arm64",
+		"i386":  "386",
+		"armhf": "arm",
+	}
+	expectedArch, ok := archMap[debArch]
+	if !ok {
+		expectedArch = debArch
+	}
+	if expectedArch != runtime.GOARCH {
+		return fmt.Errorf("Архитектура не совпадает: пакет=%s, система=%s", debArch, runtime.GOARCH)
+	}
+	return nil
+}
+
+func searchMossForPackage(dep string) string {
+	ctx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "moss", "search", dep)
+	out, err := cmd.Output()
+	if err != nil {
+		return ""
+	}
+
+	lines := strings.Split(string(out), "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "Searching") || strings.HasPrefix(line, "Repository") {
+			continue
+		}
+		parts := strings.SplitN(line, " ", 2)
+		if len(parts) > 0 {
+			pkgName := parts[0]
+			if strings.Contains(pkgName, dep) || strings.Contains(pkgName, strings.TrimPrefix(dep, "lib")) {
+				return pkgName
+			}
+		}
+	}
+	return ""
+}
+
 func loadOverrides(pkgName string) *OverrideRules {
 	file, err := os.ReadFile("stonify-rules.json")
 	if err != nil {
@@ -167,11 +286,11 @@ func loadOverrides(pkgName string) *OverrideRules {
 	}
 	var allRules map[string]OverrideRules
 	if err := json.Unmarshal(file, &allRules); err != nil {
-		fmt.Printf("[Warning] Failed to parse stonify-rules.json: %v\n", err)
+		fmt.Printf("%s⚠ Ошибка парсинга stonify-rules.json:%s %v\n", Yellow, Reset, err)
 		return nil
 	}
 	if rule, exists := allRules[pkgName]; exists {
-		fmt.Printf("      -> Applied custom overrides for %s\n", pkgName)
+		fmt.Printf("   %s↳%s Применены пользовательские правила (Overrides)\n", Cyan, Reset)
 		return &rule
 	}
 	return nil
@@ -197,7 +316,7 @@ func extractArArchive(debPath, destDir string) (string, string, error) {
 
 	sig := make([]byte, 8)
 	if _, err := io.ReadFull(file, sig); err != nil || string(sig) != "!<arch>\n" {
-		return "", "", fmt.Errorf("file is not a valid ar/.deb archive")
+		return "", "", fmt.Errorf("файл не является корректным ar/.deb архивом")
 	}
 
 	var controlTar, dataTar string
@@ -217,7 +336,7 @@ func extractArArchive(debPath, destDir string) (string, string, error) {
 		sizeStr := strings.TrimSpace(string(header[48:58]))
 		size, err := strconv.ParseInt(sizeStr, 10, 64)
 		if err != nil {
-			return "", "", fmt.Errorf("invalid file size in ar: %w", err)
+			return "", "", fmt.Errorf("неверный размер файла в ar: %w", err)
 		}
 
 		if name == "//" {
@@ -277,13 +396,13 @@ func extractArArchive(debPath, destDir string) (string, string, error) {
 	}
 
 	if controlTar == "" || dataTar == "" {
-		return "", "", fmt.Errorf("control.tar or data.tar not found in .deb archive")
+		return "", "", fmt.Errorf("в .deb не найдены control.tar или data.tar")
 	}
 
 	return controlTar, dataTar, nil
 }
 
-func parseDebControl(controlTarPath, workDir string) (*DebMetadata, error) {
+func parseDebControl(controlTarPath, workDir string, sp *Spinner) (*DebMetadata, error) {
 	controlDir := filepath.Join(workDir, "control_extracted")
 	if err := os.MkdirAll(controlDir, 0755); err != nil {
 		return nil, err
@@ -327,6 +446,11 @@ func parseDebControl(controlTarPath, workDir string) (*DebMetadata, error) {
 	version = strings.ReplaceAll(version, "-", ".")
 	version = regexp.MustCompile(`[^a-zA-Z0-9\.]`).ReplaceAllString(version, ".")
 
+	arch := strings.ToLower(fields["Architecture"])
+	if err := checkArchitecture(arch); err != nil {
+		return nil, err
+	}
+
 	summary := strings.ReplaceAll(fields["Description"], "\n", " ")
 	if summary == "" {
 		summary = "Package converted from .deb for AerynOS"
@@ -345,17 +469,26 @@ func parseDebControl(controlTarPath, workDir string) (*DebMetadata, error) {
 		homepage = "https://aerynos.dev"
 	}
 
-	var rawDeps []string
 	var translatedDeps []string
 	if depStr, ok := fields["Depends"]; ok {
 		re := regexp.MustCompile(`\(.*?\)`)
 		cleanDepStr := re.ReplaceAllString(depStr, "")
-		for _, d := range strings.Split(cleanDepStr, ",") {
+		
+		depsArray := strings.Split(cleanDepStr, ",")
+		for i, d := range depsArray {
 			d = strings.TrimSpace(d)
-			if d != "" {
-				rawDeps = append(rawDeps, d)
-				if aerynPkg, exists := depMap[d]; exists {
-					translatedDeps = append(translatedDeps, aerynPkg)
+			if d == "" {
+				continue
+			}
+
+			sp.UpdateMessage(fmt.Sprintf("Поиск зависимостей [%d/%d]: %s", i+1, len(depsArray), d))
+
+			if aerynPkg, exists := depMap[d]; exists {
+				translatedDeps = append(translatedDeps, aerynPkg)
+			} else {
+				foundPkg := searchMossForPackage(d)
+				if foundPkg != "" {
+					translatedDeps = append(translatedDeps, foundPkg)
 				}
 			}
 		}
@@ -371,20 +504,17 @@ func parseDebControl(controlTarPath, workDir string) (*DebMetadata, error) {
 	}
 
 	return &DebMetadata{
-		Name:        name,
-		Version:     version,
-		Summary:     summary,
-		Description: desc,
-		Homepage:    homepage,
-		Depends:     rawDeps,
-		AerynDeps:   finalDeps,
+		Name:         name,
+		Version:      version,
+		Architecture: arch,
+		Summary:      summary,
+		Description:  desc,
+		Homepage:     homepage,
+		AerynDeps:    finalDeps,
 	}, nil
 }
 
 func extractPayload(dataTarPath, destDir string) error {
-	if err := os.MkdirAll(destDir, 0755); err != nil {
-		return err
-	}
 	return runTarExtract(dataTarPath, destDir)
 }
 
@@ -393,13 +523,23 @@ func runTarExtract(archivePath, destDir string) error {
 	if err := cmd.Run(); err != nil {
 		cmd = exec.Command("tar", "--no-same-owner", "-xf", archivePath, "-C", destDir)
 		if err := cmd.Run(); err != nil {
-			return fmt.Errorf("archive extraction failed for %s: %w", archivePath, err)
+			return fmt.Errorf("ошибка распаковки архива %s: %w", archivePath, err)
 		}
 	}
 	return nil
 }
 
 func normalizeAndFix(rootfs string, meta *DebMetadata, rules *OverrideRules) error {
+	multiarchDirs := []string{
+		"usr/lib/x86_64-linux-gnu",
+		"lib/x86_64-linux-gnu",
+		"usr/lib/aarch64-linux-gnu",
+		"lib/aarch64-linux-gnu",
+	}
+	for _, dir := range multiarchDirs {
+		mergeDirSafe(filepath.Join(rootfs, dir), filepath.Join(rootfs, "usr", "lib"))
+	}
+
 	optDir := filepath.Join(rootfs, "opt")
 	if entries, err := os.ReadDir(optDir); err == nil && len(entries) > 0 {
 		usrLib := filepath.Join(rootfs, "usr", "lib")
@@ -432,6 +572,32 @@ func normalizeAndFix(rootfs string, meta *DebMetadata, rules *OverrideRules) err
 	mergeDirSafe(filepath.Join(rootfs, "sbin"), filepath.Join(rootfs, "usr", "bin"))
 	mergeDirSafe(filepath.Join(rootfs, "lib"), filepath.Join(rootfs, "usr", "lib"))
 	mergeDirSafe(filepath.Join(rootfs, "lib64"), filepath.Join(rootfs, "usr", "lib"))
+
+	// НОВОВВЕДЕНИЕ: Копирование скрытых .so файлов прямо в /usr/lib
+	usrLibDir := filepath.Join(rootfs, "usr", "lib")
+	var libsToCopy []string
+
+	filepath.Walk(usrLibDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil || info.IsDir() {
+			return nil
+		}
+		if strings.Contains(info.Name(), ".so") {
+			parent := filepath.Dir(path)
+			// Если библиотека спрятана в подпапке
+			if parent != usrLibDir {
+				libsToCopy = append(libsToCopy, path)
+			}
+		}
+		return nil
+	})
+
+	// Производим копирование (оно дедуплицируется в moss и позволяет boulder найти ELF-заголовки)
+	for _, libPath := range libsToCopy {
+		target := filepath.Join(usrLibDir, filepath.Base(libPath))
+		if _, err := os.Stat(target); os.IsNotExist(err) {
+			copyFile(libPath, target)
+		}
+	}
 
 	appsDir := filepath.Join(rootfs, "usr", "share", "applications")
 	os.MkdirAll(appsDir, 0755)
@@ -492,7 +658,7 @@ func mergeDirSafe(src, dst string) {
 		}
 		rel, _ := filepath.Rel(src, path)
 		target := filepath.Join(dst, rel)
-
+		
 		if info.IsDir() {
 			os.MkdirAll(target, info.Mode())
 		} else {
@@ -644,7 +810,7 @@ func patchDesktopFile(desktopPath, rootfs, pkgName string, rules *OverrideRules)
 	os.WriteFile(desktopPath, []byte(strings.Join(newLines, "\n")), 0644)
 }
 
-func generateStoneYaml(path string, meta *DebMetadata) error {
+func generateStoneYaml(path string, meta *DebMetadata, rules *OverrideRules) error {
 	escapeYAML := func(s string) string {
 		s = strings.ReplaceAll(s, "\"", "\\\"")
 		s = strings.ReplaceAll(s, "\n", "\n    ")
@@ -669,6 +835,13 @@ license     :
 		}
 	}
 
+	if rules != nil && len(rules.Provides) > 0 {
+		content += "provides:\n"
+		for _, p := range rules.Provides {
+			content += fmt.Sprintf("    - %s\n", p)
+		}
+	}
+
 	content += `install     : |
     mkdir -p %(installroot)
     SRC=""
@@ -689,7 +862,7 @@ license     :
     if [ -n "$SRC" ]; then
         cp -a "$SRC/." %(installroot)/
     else
-        echo "Error: rootfs was not found inside the boulder container!"
+        echo "Ошибка: rootfs не найден внутри контейнера boulder!"
         find /mason/recipe -maxdepth 3 2>/dev/null || true
         exit 1
     fi
@@ -700,8 +873,8 @@ license     :
 func buildWithBoulder(workDir string) (string, error) {
 	cmd := exec.Command("boulder", "build")
 	cmd.Dir = workDir
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
+	cmd.Stdout = nil 
+	cmd.Stderr = nil
 	cmd.Stdin = nil
 
 	if err := cmd.Run(); err != nil {
@@ -710,7 +883,7 @@ func buildWithBoulder(workDir string) (string, error) {
 
 	matches, err := filepath.Glob(filepath.Join(workDir, "*.stone"))
 	if err != nil || len(matches) == 0 {
-		return "", fmt.Errorf(".stone file was not created by boulder")
+		return "", fmt.Errorf(".stone файл не был создан boulder")
 	}
 
 	var selected string
@@ -728,30 +901,28 @@ func buildWithBoulder(workDir string) (string, error) {
 }
 
 func installStonePackage(repoDir, pkgName string) {
-	fmt.Println("\n[ moss ] Generating package repository index...")
+	fmt.Printf("\n%s[ moss ]%s Формирование индекса пакетов...\n", Cyan, Reset)
 	cmd := exec.Command("moss", "index")
 	cmd.Dir = repoDir
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	cmd.Run()
+	if err := cmd.Run(); err != nil {
+		fmt.Printf("%s✖ Ошибка moss index: %v%s\n", Red, err, Reset)
+		return
+	}
 
 	indexFile := filepath.Join(repoDir, "stone.index")
 	if _, err := os.Stat(indexFile); os.IsNotExist(err) {
-		fmt.Printf("Could not find index file: %s\n", indexFile)
+		fmt.Printf("%s✖ Не удалось найти %s%s\n", Red, indexFile, Reset)
 		return
 	}
 
-	fmt.Println("[ moss ] Updating local repository...")
+	fmt.Printf("%s[ moss ]%s Обновление локального репозитория...\n", Cyan, Reset)
 	exec.Command("sudo", "moss", "repo", "remove", "local").Run()
-	repoCmd := exec.Command("sudo", "moss", "repo", "add", "--comment", "Local packages", "local", "file://"+indexFile)
-	repoCmd.Stdout = os.Stdout
-	repoCmd.Stderr = os.Stderr
-	if err := repoCmd.Run(); err != nil {
-		fmt.Printf("Error adding moss repository: %v\n", err)
+	if err := exec.Command("sudo", "moss", "repo", "add", "--comment", "Local packages", "local", "file://"+indexFile).Run(); err != nil {
+		fmt.Printf("%s✖ Ошибка подключения репозитория: %v%s\n", Red, err, Reset)
 		return
 	}
 
-	fmt.Printf("[ moss ] Installing package %s...\n", pkgName)
+	fmt.Printf("%s[ moss ]%s Установка пакета %s...\n", Cyan, Reset, pkgName)
 	installCmd := exec.Command("sudo", "moss", "pkg", "add", "--reinstall", pkgName)
 	installCmd.Stdout = os.Stdout
 	installCmd.Stderr = os.Stderr
@@ -760,14 +931,18 @@ func installStonePackage(repoDir, pkgName string) {
 		fallbackCmd := exec.Command("sudo", "moss", "pkg", "add", pkgName)
 		fallbackCmd.Stdout = os.Stdout
 		fallbackCmd.Stderr = os.Stderr
-		fallbackCmd.Run()
+		if err := fallbackCmd.Run(); err != nil {
+			fmt.Printf("\n%s✖ Ошибка установки пакета через moss. Возможно, не хватает зависимостей.%s\n", Red, Reset)
+			return
+		}
 	}
 
-	fmt.Println("[ Desktop ] Refreshing application shortcuts and icon caches...")
+	fmt.Printf("%s[ Desktop ]%s Обновление кэша ярлыков и иконок...\n", Cyan, Reset)
 	exec.Command("kbuildsycoca6").Run()
 	exec.Command("update-desktop-database", "-q").Run()
 	exec.Command("gtk-update-icon-cache", "-q", "-t", "-f", "/usr/share/icons/hicolor").Run()
-	fmt.Println("[Done] Package successfully installed and ready to launch!")
+	
+	fmt.Printf("\n%s✔ Пакет %s успешно установлен и готов к запуску!%s\n", Green, pkgName, Reset)
 }
 
 func copyFile(src, dst string) error {
